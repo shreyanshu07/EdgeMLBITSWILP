@@ -1,0 +1,113 @@
+---
+# logibridge_deploy.yml — LogiEdge OTA Model Deployment Playbook (Task E2)
+# ===========================================================================
+# Deploys a new model + reference distribution to a truck's edge node and
+# restarts the inference container, with EXACTLY 7 tasks as required.
+#
+# Idempotency design: tasks 4-6 (stop/pull/start the container) only run
+# `when: model_copy.changed or reference_copy.changed` -- i.e. only when
+# Task 2 or Task 3 actually changed a file on disk (Ansible's `copy` module
+# compares file checksums, so it reports changed=false if the content is
+# identical to what's already deployed). Running this playbook a second
+# time with no new model/reference file therefore performs tasks 1-3 as
+# no-ops (changed=false, verified by checksum) and SKIPS tasks 4-6 entirely
+# -- the whole play reports changed=0, demonstrating idempotent OTA
+# deployment exactly as required.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini logibridge_deploy.yml \
+#       -e model_src=../inference/model_m2_ptq_int8.tflite \
+#       -e reference_src=../monitoring/reference_dist.json \
+#       -e truck_id=truck-07
+#
+#   Run it a second time with the SAME -e values to observe `changed=0`.
+
+- name: Deploy / update the LogiEdge inference container on a truck edge node
+  hosts: logibridge_trucks
+  become: true
+  vars:
+    logibridge_dir: /opt/logibridge
+    model_dest: "{{ logibridge_dir }}/model.tflite"
+    reference_dest: "{{ logibridge_dir }}/reference_dist.json"
+    container_name: logibridge-inference
+    registry_image: "localhost:5000/logibridge-inference:latest"
+    truck_id: "truck-01"
+    mqtt_broker: "localhost"
+
+  tasks:
+    # Task 1 — Create /opt/logibridge directory if not present
+    - name: Ensure /opt/logibridge directory exists
+      ansible.builtin.file:
+        path: "{{ logibridge_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Task 2 — Copy new model file to /opt/logibridge/model.tflite
+    - name: Copy new model file to /opt/logibridge/model.tflite
+      ansible.builtin.copy:
+        src: "{{ model_src }}"
+        dest: "{{ model_dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: model_copy
+
+    # Task 3 — Copy updated reference_dist.json
+    - name: Copy updated reference_dist.json
+      ansible.builtin.copy:
+        src: "{{ reference_src }}"
+        dest: "{{ reference_dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: reference_copy
+
+    # Task 4 — Stop the running inference container if running
+    - name: Stop the running inference container if running
+      ansible.builtin.command: "docker stop {{ container_name }}"
+      register: stop_result
+      failed_when: false
+      changed_when: "container_name in (stop_result.stdout | default(''))"
+      when: model_copy.changed or reference_copy.changed
+
+    # Task 5 — Pull updated container image from local Docker registry
+    - name: Pull updated container image from local Docker registry
+      ansible.builtin.command: "docker pull {{ registry_image }}"
+      register: pull_result
+      changed_when: >
+        'Downloaded newer image' in pull_result.stdout
+        or 'Status: Downloaded' in pull_result.stdout
+      when: model_copy.changed or reference_copy.changed
+
+    # Task 6 — Start inference container with environment variables
+    - name: Start inference container with environment variables
+      ansible.builtin.command: >
+        docker run -d --rm --name {{ container_name }}
+        -e MODEL_PATH=/app/models/model_m2_ptq_int8.tflite
+        -e STATS_PATH=/app/data/training_stats.npy
+        -e ALERT_LOG_PATH=/app/data/alert_log.jsonl
+        -e TRUCK_ID={{ truck_id }}
+        -e MQTT_BROKER={{ mqtt_broker }}
+        -v {{ model_dest }}:/app/models/model_m2_ptq_int8.tflite:ro
+        -v {{ reference_dest }}:/app/data/reference_dist.json:ro
+        {{ registry_image }}
+      register: start_result
+      changed_when: start_result.rc == 0
+      when: model_copy.changed or reference_copy.changed
+
+    # Task 7 — Wait 15 seconds and verify container is running
+    - name: Wait 15 seconds and verify container is running
+      block:
+        - name: Pause 15 seconds for the container to stabilise
+          ansible.builtin.wait_for:
+            timeout: 15
+          changed_when: false
+
+        - name: Verify the inference container is running
+          ansible.builtin.command: >
+            docker ps --filter "name={{ container_name }}" --filter "status=running" -q
+          register: verify_result
+          changed_when: false
+          failed_when: verify_result.stdout | trim == ""
